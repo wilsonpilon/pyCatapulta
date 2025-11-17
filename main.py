@@ -4,61 +4,69 @@ import json
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import List, Optional
+
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
-# Arquivos de configuração
-CONFIG_FILE = Path("app_config.json")
-DEFAULT_DB = "app_data.db"
+# Application directories and config
+APP_DIR = Path(os.getenv("APPDATA") or Path.home()) / "openmsx_frontend"
+APP_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_FILE = APP_DIR / "app_config.json"
+DEFAULT_DB = str(APP_DIR / "app_data.db")
 
 
 def ensure_config_file():
     if not CONFIG_FILE.exists():
-        CONFIG_FILE.write_text(json.dumps({"db_path": DEFAULT_DB}, indent=2))
+        CONFIG_FILE.write_text(json.dumps({"db_path": DEFAULT_DB}, indent=2), encoding="utf-8")
 
 
-def load_config():
+def load_config() -> dict:
     ensure_config_file()
     with CONFIG_FILE.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
 class DBManager:
-    def __init__(self, db_path):
-        self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path)
-        self._ensure_table()
+    """Simple SQLite config storage. Uses `INSERT OR REPLACE` for compatibility."""
+    def __init__(self, db_path: str):
+        self.db_path = str(Path(db_path).resolve())
+        try:
+            self.conn = sqlite3.connect(self.db_path, timeout=5)
+            self._ensure_table()
+        except Exception as e:
+            messagebox.showerror("DB Error", f"Failed opening DB `{self.db_path}`:\n{e}")
+            raise
 
     def _ensure_table(self):
         cur = self.conn.cursor()
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-        )
+        cur.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self.conn.commit()
 
-    def get(self, key):
+    def get(self, key: str) -> Optional[str]:
         cur = self.conn.cursor()
         cur.execute("SELECT value FROM config WHERE key = ?", (key,))
         row = cur.fetchone()
         return row[0] if row else None
 
-    def set(self, key, value):
+    def set(self, key: str, value: str):
         cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO config(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
+        cur.execute("INSERT OR REPLACE INTO config(key, value) VALUES(?, ?)", (key, value))
         self.conn.commit()
 
     def close(self):
-        self.conn.close()
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
 
 class OpenMSXFrontend:
     def __init__(self):
         if sys.platform != "win32":
-            messagebox.showerror("Plataforma não suportada", "Este programa roda apenas no Windows.")
+            messagebox.showerror("Unsupported platform", "This program runs only on Windows.")
             sys.exit(1)
 
         ctk.set_appearance_mode("System")
@@ -70,87 +78,224 @@ class OpenMSXFrontend:
 
         self.root = ctk.CTk()
         self.root.title("openMSX Frontend")
-        self.root.geometry("700x320")
+        self.root.geometry("760x380")
         self.root.minsize(640, 320)
 
         self.status_var = ctk.StringVar()
-        self.pid_var = ctk.StringVar(value="PID: Não iniciado")
+        self.pid_var = ctk.StringVar(value="PID: Not started")
         self.socket_var = ctk.StringVar(value="Socket: -")
-        self.current_socket_path = None
+        self.machine_var = ctk.StringVar(value="")
+        self.current_socket_path: Optional[str] = None
+        self._machines_cache: List[str] = []
 
         self._build_main_ui()
+        self._load_machines()  # safe: combobox exists
+        self._update_status()
 
         if not self.db.get("openmsx_dir"):
             self.open_config_window(initial=True)
 
     def _build_main_ui(self):
         frame = ctk.CTkFrame(self.root, corner_radius=8)
-        frame.pack(padx=20, pady=20, fill="both", expand=True)
+        frame.pack(padx=16, pady=16, fill="both", expand=True)
 
-        label = ctk.CTkLabel(frame, text="openMSX Frontend", font=ctk.CTkFont(size=20, weight="bold"))
-        label.pack(pady=(8, 16))
+        header = ctk.CTkLabel(frame, text="openMSX Frontend", font=ctk.CTkFont(size=20, weight="bold"))
+        header.pack(pady=(6, 12))
 
-        btn_start = ctk.CTkButton(frame, text="Iniciar openMSX", command=self.start_openmsx)
-        btn_start.pack(pady=6, ipadx=10, ipady=6)
+        controls = ctk.CTkFrame(frame, corner_radius=0)
+        controls.pack(fill="x", padx=8)
 
-        btn_config = ctk.CTkButton(frame, text="Configuração", command=lambda: self.open_config_window(initial=False))
-        btn_config.pack(pady=6, ipadx=10, ipady=6)
+        btn_start = ctk.CTkButton(controls, text="Start openMSX", command=self.start_openmsx)
+        btn_start.pack(side="left", padx=(0, 8))
 
-        # Linha com PID e Socket em linhas separadas (PID acima, Socket abaixo)
-        info_row = ctk.CTkFrame(frame, corner_radius=0)
-        info_row.pack(fill="x", pady=(12, 0), padx=10)
+        btn_config = ctk.CTkButton(controls, text="Configuration", command=lambda: self.open_config_window(initial=False))
+        btn_config.pack(side="left", padx=(0, 8))
 
-        pid_label = ctk.CTkLabel(info_row, textvariable=self.pid_var, anchor="w",
-                                 font=ctk.CTkFont(size=12, weight="bold"))
+        # PID / Socket display
+        info = ctk.CTkFrame(frame, corner_radius=0)
+        info.pack(fill="x", pady=(12, 0), padx=8)
+
+        pid_label = ctk.CTkLabel(info, textvariable=self.pid_var, anchor="w", font=ctk.CTkFont(size=12, weight="bold"))
         pid_label.pack(fill="x", anchor="w")
 
-        socket_label = ctk.CTkLabel(info_row, textvariable=self.socket_var, anchor="w",
-                                    font=ctk.CTkFont(size=10))
+        socket_label = ctk.CTkLabel(info, textvariable=self.socket_var, anchor="w", font=ctk.CTkFont(size=10))
         socket_label.pack(fill="x", pady=(4, 0), anchor="w")
 
-        # Botão Ver Socket
-        self.btn_socket = ctk.CTkButton(
-            frame,
-            text="Ver Socket",
-            command=self._check_socket,
-            state="disabled",
-            fg_color="gray"
-        )
-        self.btn_socket.pack(pady=6, ipadx=10, ipady=6)
+        # Machine combobox
+        machine_row = ctk.CTkFrame(frame, corner_radius=0)
+        machine_row.pack(fill="x", pady=(12, 0), padx=8)
 
-        status_label = ctk.CTkLabel(frame, textvariable=self.status_var, anchor="w")
-        status_label.pack(fill="x", pady=(12, 0), padx=10)
-        self._update_status()
+        machine_label = ctk.CTkLabel(machine_row, text="MSX Model:", anchor="w", font=ctk.CTkFont(size=12))
+        machine_label.pack(side="left")
 
-    def _update_socket_button(self, pid):
-        # monta caminho do socket (usa TEMP com fallback)
+        self.combo_machines = ctk.CTkComboBox(machine_row, values=[], variable=self.machine_var, width=420, command=self._on_machine_selected)
+        self.combo_machines.pack(side="left", padx=(8, 0))
+        self.combo_machines.configure(values=[], state="disabled")
+
+        # Buttons area
+        bottom = ctk.CTkFrame(frame, corner_radius=0)
+        bottom.pack(fill="x", pady=(16, 0), padx=8)
+
+        self.btn_socket = ctk.CTkButton(bottom, text="Open Socket", command=self._check_socket, state="disabled", fg_color="gray")
+        self.btn_socket.pack(side="left", padx=(0, 8))
+
+        status_label = ctk.CTkLabel(bottom, textvariable=self.status_var)
+        status_label.pack(side="left", padx=(8, 0))
+
+    def _machines_dir(self, openmsx_dir: str) -> Path:
+        return Path(openmsx_dir) / "share" / "machines"
+
+    def _get_machines(self) -> List[str]:
+        """Return sorted list of machine names (file stems) from share/machines."""
+        openmsx_dir = self.db.get("openmsx_dir") or ""
+        machines: List[str] = []
+        if openmsx_dir:
+            p = self._machines_dir(openmsx_dir)
+            if p.exists() and p.is_dir():
+                for f in sorted(p.glob("*.xml")):
+                    machines.append(f.stem)
+        return machines
+
+    def _load_machines(self):
+        machines = self._get_machines()
+        self._machines_cache = machines
+        if machines:
+            self.combo_machines.configure(values=machines, state="normal")
+            # restore saved selection if valid
+            saved = self.db.get("openmsx_machine")
+            if saved and saved in machines:
+                self.machine_var.set(saved)
+            else:
+                # default to first
+                self.machine_var.set(machines[0])
+                self.db.set("openmsx_machine", machines[0])
+        else:
+            self.combo_machines.configure(values=[], state="disabled")
+            self.machine_var.set("")
+            self.db.set("openmsx_machine", "")
+
+    def _on_machine_selected(self, value: str):
+        """Called when user chooses a machine in the combobox."""
+        try:
+            if value:
+                self.db.set("openmsx_machine", value)
+            else:
+                self.db.set("openmsx_machine", "")
+        except Exception:
+            pass
+
+    def start_openmsx(self):
+        dir_path = self.db.get("openmsx_dir")
+        if not dir_path:
+            messagebox.showerror("Error", "openMSX directory not configured.")
+            return
+
+        exe_path = str(Path(dir_path) / "openmsx.exe")
+        if not Path(exe_path).is_file():
+            messagebox.showerror("Error", f"`openmsx.exe` not found in:\n{exe_path}")
+            return
+
+        # Prefer current combobox selection, fallback to DB
+        machine = (self.machine_var.get() or self.db.get("openmsx_machine") or "").strip()
+        if not machine:
+            messagebox.showwarning("Machine not selected",
+                                   "Please select an MSX model from the combobox before starting.")
+            return
+
+        try:
+            # Build command with -machine option
+            cmd = [exe_path, "-machine", machine]
+            proc = subprocess.Popen(cmd, cwd=dir_path)
+            initial_pid = proc.pid
+            real_pid = initial_pid
+
+            # Try to refine using psutil with a short retry loop
+            try:
+                import psutil
+                deadline = time.time() + 2.0  # up to 2 seconds
+                while time.time() < deadline:
+                    matches = []
+                    for p in psutil.process_iter(['pid', 'exe', 'ppid']):
+                        try:
+                            exe = p.info.get('exe')
+                            if exe and os.path.normcase(os.path.normpath(exe)) == os.path.normcase(
+                                    os.path.normpath(exe_path)):
+                                matches.append(p.pid)
+                        except Exception:
+                            continue
+                    if matches:
+                        real_pid = matches[-1]
+                        break
+                    try:
+                        parent = psutil.Process(initial_pid)
+                        children = parent.children(recursive=True)
+                        if children:
+                            real_pid = children[0].pid
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.15)
+            except ImportError:
+                messagebox.showwarning("psutil not installed",
+                                       "Install `psutil` to improve PID detection (pip install psutil). Using initial PID.")
+            except Exception:
+                pass
+
+            # Persist status
+            self.db.set("openmsx_pid", str(real_pid))
+            self.pid_var.set(f"PID: {real_pid}")
+            self.status_var.set(f"openMSX started: {exe_path} -machine {machine}")
+
+            # Socket path & UI update
+            self._update_socket_button(real_pid)
+        except Exception as e:
+            messagebox.showerror("Start Error", f"Failed to start openMSX:\n{e}")
+
+    def _update_socket_button(self, pid: int):
         temp_dir = os.getenv("TEMP") or os.getcwd()
         socket_path = os.path.join(temp_dir, "openmsx-default", f"socket.{pid}")
-
-        # armazena e mostra o caminho no campo "Socket" da interface
         self.current_socket_path = socket_path
         self.socket_var.set(f"Socket: {socket_path}")
 
-        # atualiza estado/cor do botão conforme existência do arquivo
         if hasattr(self, "btn_socket"):
-            if os.path.exists(socket_path):
-                self.btn_socket.configure(state="normal", fg_color="green")
-            else:
-                self.btn_socket.configure(state="normal", fg_color="red")
+            try:
+                exists = os.path.exists(socket_path)
+                # enable button even if not present, color indicates presence
+                self.btn_socket.configure(state="normal", fg_color="green" if exists else "red")
+            except Exception:
+                # fallback: enable but gray
+                self.btn_socket.configure(state="normal", fg_color="gray")
 
-    def open_config_window(self, initial=False):
+    def _check_socket(self):
+        path = self.current_socket_path
+        if not path:
+            messagebox.showwarning("Socket", "No socket path available.")
+            return
+        if os.path.exists(path):
+            try:
+                # Use explorer to select the file
+                subprocess.Popen(['explorer', f'/select,{path}'])
+            except Exception:
+                # fallback: open folder
+                try:
+                    os.startfile(os.path.dirname(path))
+                except Exception as e:
+                    messagebox.showerror("Open Error", f"Can't open explorer:\n{e}")
+        else:
+            messagebox.showwarning("Socket not found", f"Socket doesn't exist at:\n{path}")
+
+    def open_config_window(self, initial: bool = False):
         win = ctk.CTkToplevel(self.root)
-        win.title("Configuração")
-        win.geometry("560x180")
+        win.title("Configuration")
+        win.geometry("640x160")
         win.grab_set()
 
         cur_dir = self.db.get("openmsx_dir") or ""
         entry_var = ctk.StringVar(value=cur_dir)
 
-        lbl = ctk.CTkLabel(win, text="Diretório do openMSX (pasta contendo openmsx.exe):")
+        lbl = ctk.CTkLabel(win, text="openMSX directory (folder containing openmsx.exe):")
         lbl.pack(padx=12, pady=(12, 6), anchor="w")
 
-        # Frame para entrada + botão selecionar
         entry_row = ctk.CTkFrame(win, corner_radius=0)
         entry_row.pack(fill="x", padx=12, pady=(0, 6))
 
@@ -158,14 +303,13 @@ class OpenMSXFrontend:
         entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
         def choose_dir():
-            d = filedialog.askdirectory(title="Selecione o diretório do openMSX")
+            d = filedialog.askdirectory(title="Select openMSX directory")
             if d:
                 entry_var.set(d)
 
-        btn_choose = ctk.CTkButton(entry_row, text="Selecionar", width=120, command=choose_dir)
+        btn_choose = ctk.CTkButton(entry_row, text="Browse", width=120, command=choose_dir)
         btn_choose.pack(side="right")
 
-        # Buttons frame
         btn_frame = ctk.CTkFrame(win, corner_radius=0)
         btn_frame.pack(fill="x", padx=12, pady=(8, 12))
 
@@ -175,166 +319,80 @@ class OpenMSXFrontend:
         def save():
             path = entry_var.get().strip()
             if not path:
-                messagebox.showwarning("Validação", "O diretório não pode ficar vazio.")
+                messagebox.showwarning("Validation", "Directory cannot be empty.")
                 return
             exe_path = os.path.join(path, "openmsx.exe")
             if not os.path.isfile(exe_path):
-                messagebox.showerror("Arquivo não encontrado", f"Não foi encontrado `openmsx.exe` em:\n{exe_path}")
+                messagebox.showerror("Not found", f"`openmsx.exe` not found at:\n{exe_path}")
                 return
-            self.db.set("openmsx_dir", path)
-            self._update_status()
-            win.destroy()
+            try:
+                # Save openmsx_dir and make DB path absolute if needed
+                self.db.set("openmsx_dir", path)
+                self._load_machines()
+                self._update_status()
+            except Exception as e:
+                messagebox.showerror("Save Error", f"Failed saving configuration:\n{e}")
+            finally:
+                win.destroy()
 
         def cancel():
             win.destroy()
             if initial and not self.db.get("openmsx_dir"):
-                messagebox.showinfo("Configuração necessária",
-                                    "Configuração não concluída. Você pode configurar depois via botão `Configuração`.")
+                messagebox.showinfo("Configuration required", "Configuration not completed. You can configure later using the 'Configuration' button.")
 
-        # Botão Reset à esquerda
-        btn_reset = ctk.CTkButton(btn_frame, text="Resetar", command=reset)
+        btn_reset = ctk.CTkButton(btn_frame, text="Reset", command=reset)
         btn_reset.pack(side="left", padx=6, pady=6)
 
-        # Espaçador que expande para empurrar os botões finais para a direita
         spacer = ctk.CTkLabel(btn_frame, text="")
         spacer.pack(side="left", expand=True)
 
-        # Botões Cancelar e Salvar à direita
-        btn_cancel = ctk.CTkButton(btn_frame, text="Cancelar", command=cancel)
+        btn_cancel = ctk.CTkButton(btn_frame, text="Cancel", command=cancel)
         btn_cancel.pack(side="right", padx=6, pady=6)
 
-        btn_save = ctk.CTkButton(btn_frame, text="Salvar", command=save)
+        btn_save = ctk.CTkButton(btn_frame, text="Save", command=save)
         btn_save.pack(side="right", padx=6, pady=6)
 
-    def start_openmsx(self):
-        dir_path = self.db.get("openmsx_dir")
-        if not dir_path:
-            messagebox.showerror("Erro", "Nenhum diretório do openMSX configurado.")
-            return
-        exe_path = os.path.join(dir_path, "openmsx.exe")
-        if not os.path.isfile(exe_path):
-            messagebox.showerror("Erro", f"`openmsx.exe` não encontrado em:\n{exe_path}")
-            return
-        try:
-            proc = subprocess.Popen([exe_path], cwd=dir_path)
-            initial_pid = proc.pid
-            real_pid = initial_pid
+    def _update_status(self):
+        openmsx_dir = self.db.get("openmsx_dir")
+        if openmsx_dir:
+            self.status_var.set(f"openMSX: {openmsx_dir}")
+        else:
+            self.status_var.set("openMSX not configured")
 
-            # Tenta usar psutil para localizar o processo real `openmsx.exe`
+        pid = self.db.get("openmsx_pid")
+        if pid:
             try:
-                import time
-                import psutil
-                time.sleep(0.5)  # aguarda o processo principal/filhos aparecerem
+                pid_int = int(pid)
+                self.pid_var.set(f"PID: {pid_int}")
+                self._update_socket_button(pid_int)
+            except (ValueError, TypeError):
+                self.pid_var.set("PID: invalid")
+                self.socket_var.set("Socket: -")
+                self.current_socket_path = None
+                if hasattr(self, "btn_socket"):
+                    self.btn_socket.configure(state="disabled", fg_color="gray")
+        else:
+            self.pid_var.set("PID: Not started")
+            self.socket_var.set("Socket: -")
+            self.current_socket_path = None
+            if hasattr(self, "btn_socket"):
+                self.btn_socket.configure(state="disabled", fg_color="gray")
 
-                matches = []
-                for p in psutil.process_iter(['pid', 'exe', 'ppid']):
-                    try:
-                        exe = p.info.get('exe')
-                        if exe and os.path.normcase(os.path.normpath(exe)) == os.path.normcase(
-                                os.path.normpath(exe_path)):
-                            matches.append((p.pid, p))
-                    except Exception:
-                        continue
-
-                if matches:
-                    # escolhe o último match (mais provável ser o processo ativo)
-                    real_pid = matches[-1][0]
-                else:
-                    # se não encontrou por exe, procura filhos do processo inicial
-                    try:
-                        parent = psutil.Process(initial_pid)
-                        children = parent.children(recursive=True)
-                        if children:
-                            # pega o primeiro filho (ou escolha outra heurística se necessário)
-                            real_pid = children[0].pid
-                    except Exception:
-                        pass
-
-            except ImportError:
-                messagebox.showwarning("Aviso",
-                                       "Para detectar o PID real do `openmsx.exe` instale o pacote `psutil` (pip install psutil). Usando PID inicial do processo.")
-            except Exception:
-                # falha silenciosa: mantém initial_pid
-                pass
-
-            # Atualiza DB e UI com o PID encontrado
-            self.db.set("openmsx_pid", str(real_pid))
-            self.pid_var.set(f"PID: {real_pid}")
-            self.status_var.set(f"openMSX iniciado: {exe_path}")
-
-            # monta e mostra o caminho do socket imediatamente
-            temp_dir = os.getenv("TEMP") or os.getcwd()
-            socket_path = os.path.join(temp_dir, "openmsx-default", f"socket.{real_pid}")
-            self.current_socket_path = socket_path
-            self.socket_var.set(f"Socket: {socket_path}")
-
-            # atualiza botão (cor/estado) conforme existência do arquivo
-            if hasattr(self, "_update_socket_button"):
-                try:
-                    self._update_socket_button(real_pid)
-                except Exception:
-                    # garantir que botão não quebre
-                    if hasattr(self, "btn_socket"):
-                        self.btn_socket.configure(state="normal", fg_color="red")
-        except Exception as e:
-            messagebox.showerror("Erro ao iniciar", f"Falha ao iniciar openMSX:\n{e}")
+        # Restore selected machine into combobox if present
+        saved = self.db.get("openmsx_machine")
+        if saved and saved in self._machines_cache:
+            self.machine_var.set(saved)
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.mainloop()
 
     def _on_close(self):
-        self.db.close()
-        self.root.destroy()
+        try:
+            self.db.close()
+        finally:
+            self.root.destroy()
 
-    def _update_socket_button(self, pid):
-        temp_dir = os.getenv("TEMP")
-        socket_path = os.path.join(temp_dir, "openmsx-default", f"socket.{pid}")
-
-        if os.path.exists(socket_path):
-            self.btn_socket.configure(state="normal", fg_color="green")
-        else:
-            self.btn_socket.configure(state="normal", fg_color="red")
-
-    def _check_socket(self):
-        path = getattr(self, "current_socket_path", None)
-        if not path:
-            messagebox.showwarning("Socket não definido", "Nenhum caminho de socket disponível.")
-            return
-
-        if os.path.exists(path):
-            subprocess.Popen(f'explorer /select,"{path}"')
-        else:
-            messagebox.showwarning("Socket não encontrado", f"O socket não existe em:\n{path}")
-
-    def _update_status(self):
-        # Atualiza status do diretório openMSX
-        openmsx_dir = self.db.get("openmsx_dir")
-        if openmsx_dir:
-            self.status_var.set(f"openMSX: {openmsx_dir}")
-        else:
-            self.status_var.set("openMSX não configurado")
-
-        # Recupera PID salvo no DB e atualiza UI
-        pid = self.db.get("openmsx_pid")
-        if pid:
-            try:
-                pid_int = int(pid)
-                self.pid_var.set(f"PID: {pid_int}")
-                # Atualiza caminho do socket e botão
-                self._update_socket_button(pid_int)
-            except (ValueError, TypeError):
-                self.pid_var.set("PID: inválido")
-                self.socket_var.set("Socket: -")
-                self.current_socket_path = None
-                if hasattr(self, "btn_socket"):
-                    self.btn_socket.configure(state="disabled", fg_color="gray")
-        else:
-            self.pid_var.set("PID: Não iniciado")
-            self.socket_var.set("Socket: -")
-            self.current_socket_path = None
-            if hasattr(self, "btn_socket"):
-                self.btn_socket.configure(state="disabled", fg_color="gray")
 
 if __name__ == "__main__":
     app = OpenMSXFrontend()
