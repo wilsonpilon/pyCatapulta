@@ -10,6 +10,7 @@ from typing import List, Optional
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
+import tkinter as tk
 
 # Application directories and config
 APP_DIR = Path(os.getenv("APPDATA") or Path.home()) / "openmsx_frontend"
@@ -78,18 +79,22 @@ class OpenMSXFrontend:
 
         self.root = ctk.CTk()
         self.root.title("openMSX Frontend")
-        self.root.geometry("760x380")
+        self.root.geometry("760x420")
         self.root.minsize(640, 320)
 
         self.status_var = ctk.StringVar()
         self.pid_var = ctk.StringVar(value="PID: Not started")
-        self.socket_var = ctk.StringVar(value="Socket: -")
+        self.socket_var = ctk.StringVar(value="Socket:\n-")
         self.machine_var = ctk.StringVar(value="")
         self.current_socket_path: Optional[str] = None
+
         self._machines_cache: List[str] = []
+        self._extensions_cache: List[str] = []
+        self.listbox_extensions: Optional[tk.Listbox] = None
 
         self._build_main_ui()
-        self._load_machines()  # safe: combobox exists
+        self._load_machines()
+        self._load_extensions()
         self._update_status()
 
         if not self.db.get("openmsx_dir"):
@@ -118,7 +123,8 @@ class OpenMSXFrontend:
         pid_label = ctk.CTkLabel(info, textvariable=self.pid_var, anchor="w", font=ctk.CTkFont(size=12, weight="bold"))
         pid_label.pack(fill="x", anchor="w")
 
-        socket_label = ctk.CTkLabel(info, textvariable=self.socket_var, anchor="w", font=ctk.CTkFont(size=10))
+        # Socket on the next line for readability; allow wrapping
+        socket_label = ctk.CTkLabel(info, textvariable=self.socket_var, anchor="w", font=ctk.CTkFont(size=10), wraplength=720, justify="left")
         socket_label.pack(fill="x", pady=(4, 0), anchor="w")
 
         # Machine combobox
@@ -132,9 +138,32 @@ class OpenMSXFrontend:
         self.combo_machines.pack(side="left", padx=(8, 0))
         self.combo_machines.configure(values=[], state="disabled")
 
+        # Inserir área de extensões abaixo do machine_row
+        ext_row = ctk.CTkFrame(frame, corner_radius=0)
+        ext_row.pack(fill="both", pady=(12, 0), padx=8, expand=False)
+
+        ext_label = ctk.CTkLabel(ext_row, text="Extensions:", anchor="w", font=ctk.CTkFont(size=12))
+        ext_label.pack(anchor="w")
+
+        # Frame para listbox + scrollbar (usar widgets tk dentro do CTkFrame)
+        list_frame = ctk.CTkFrame(ext_row, corner_radius=0)
+        list_frame.pack(fill="both", pady=(6, 0), expand=True)
+
+        # listbox tkinter com seleção múltipla e altura 8
+        lb = tk.Listbox(list_frame, selectmode=tk.MULTIPLE, height=8, exportselection=False)
+        lb.pack(side="left", fill="both", expand=True)
+
+        sb = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=lb.yview)
+        sb.pack(side="right", fill="y")
+        lb.config(yscrollcommand=sb.set)
+
+        # armazenar referência e bind para salvar seleção quando mudar
+        self.listbox_extensions = lb
+        lb.bind("<<ListboxSelect>>", self._on_extensions_selected)
+
         # Buttons area
         bottom = ctk.CTkFrame(frame, corner_radius=0)
-        bottom.pack(fill="x", pady=(16, 0), padx=8)
+        bottom.pack(fill="x", pady=(12, 0), padx=8)
 
         self.btn_socket = ctk.CTkButton(bottom, text="Open Socket", command=self._check_socket, state="disabled", fg_color="gray")
         self.btn_socket.pack(side="left", padx=(0, 8))
@@ -144,6 +173,9 @@ class OpenMSXFrontend:
 
     def _machines_dir(self, openmsx_dir: str) -> Path:
         return Path(openmsx_dir) / "share" / "machines"
+
+    def _extensions_dir(self, openmsx_dir: str) -> Path:
+        return Path(openmsx_dir) / "share" / "extensions"
 
     def _get_machines(self) -> List[str]:
         """Return sorted list of machine names (file stems) from share/machines."""
@@ -155,6 +187,21 @@ class OpenMSXFrontend:
                 for f in sorted(p.glob("*.xml")):
                     machines.append(f.stem)
         return machines
+
+    def _get_extensions(self) -> List[str]:
+        """Retorna nomes (sem .xml) das extensões em share/extensions."""
+        openmsx_dir = self.db.get("openmsx_dir") or ""
+        exts: List[str] = []
+        if openmsx_dir:
+            p = self._extensions_dir(openmsx_dir)
+            if p.exists() and p.is_dir():
+                for f in sorted(p.iterdir()):
+                    try:
+                        if f.is_file() and f.suffix.lower() == ".xml":
+                            exts.append(f.stem)
+                    except Exception:
+                        continue
+        return exts
 
     def _load_machines(self):
         machines = self._get_machines()
@@ -168,11 +215,45 @@ class OpenMSXFrontend:
             else:
                 # default to first
                 self.machine_var.set(machines[0])
-                self.db.set("openmsx_machine", machines[0])
+                try:
+                    self.db.set("openmsx_machine", machines[0])
+                except Exception:
+                    pass
         else:
             self.combo_machines.configure(values=[], state="disabled")
             self.machine_var.set("")
-            self.db.set("openmsx_machine", "")
+            try:
+                self.db.set("openmsx_machine", "")
+            except Exception:
+                pass
+
+    def _load_extensions(self):
+        """Preenche a listbox de extensões e restaura seleção do DB."""
+        exts = self._get_extensions()
+        self._extensions_cache = exts
+
+        if self.listbox_extensions:
+            lb = self.listbox_extensions
+            lb.delete(0, tk.END)
+            for item in exts:
+                lb.insert(tk.END, item)
+
+            if exts:
+                # restaurar seleção salva (JSON)
+                saved = self.db.get("openmsx_extensions")
+                try:
+                    if saved:
+                        sel = json.loads(saved)
+                        if isinstance(sel, list):
+                            lb.selection_clear(0, tk.END)
+                            for i, name in enumerate(exts):
+                                if name in sel:
+                                    lb.selection_set(i)
+                except Exception:
+                    pass
+                lb.configure(state="normal")
+            else:
+                lb.configure(state="disabled")
 
     def _on_machine_selected(self, value: str):
         """Called when user chooses a machine in the combobox."""
@@ -181,6 +262,21 @@ class OpenMSXFrontend:
                 self.db.set("openmsx_machine", value)
             else:
                 self.db.set("openmsx_machine", "")
+        except Exception:
+            pass
+
+    def _get_selected_extensions(self) -> List[str]:
+        """Retorna lista de nomes selecionados na listbox."""
+        if not self.listbox_extensions:
+            return []
+        sel_idxs = self.listbox_extensions.curselection()
+        return [self._extensions_cache[i] for i in sel_idxs if 0 <= i < len(self._extensions_cache)]
+
+    def _on_extensions_selected(self, event=None):
+        """Salva seleção atual das extensões no DB."""
+        selected = self._get_selected_extensions()
+        try:
+            self.db.set("openmsx_extensions", json.dumps(selected))
         except Exception:
             pass
 
@@ -195,7 +291,6 @@ class OpenMSXFrontend:
             messagebox.showerror("Error", f"`openmsx.exe` not found in:\n{exe_path}")
             return
 
-        # Prefer current combobox selection, fallback to DB
         machine = (self.machine_var.get() or self.db.get("openmsx_machine") or "").strip()
         if not machine:
             messagebox.showwarning("Machine not selected",
@@ -203,13 +298,19 @@ class OpenMSXFrontend:
             return
 
         try:
-            # Build command with -machine option
+            # Build command with -machine option and -ext for cada extensão selecionada
             cmd = [exe_path, "-machine", machine]
+
+            # anexar extensões selecionadas
+            exts = self._get_selected_extensions()
+            for e in exts:
+                cmd.extend(["-ext", e])
+
             proc = subprocess.Popen(cmd, cwd=dir_path)
             initial_pid = proc.pid
             real_pid = initial_pid
 
-            # Try to refine using psutil with a short retry loop
+            # Try to refine using psutil with a short retry loop to find the actual openmsx.exe process
             try:
                 import psutil
                 deadline = time.time() + 2.0  # up to 2 seconds
@@ -218,19 +319,20 @@ class OpenMSXFrontend:
                     for p in psutil.process_iter(['pid', 'exe', 'ppid']):
                         try:
                             exe = p.info.get('exe')
-                            if exe and os.path.normcase(os.path.normpath(exe)) == os.path.normcase(
-                                    os.path.normpath(exe_path)):
+                            if exe and os.path.normcase(os.path.normpath(exe)) == os.path.normcase(os.path.normpath(exe_path)):
                                 matches.append(p.pid)
                         except Exception:
                             continue
                     if matches:
                         real_pid = matches[-1]
                         break
+                    # fallback: check children of initial process
                     try:
                         parent = psutil.Process(initial_pid)
                         children = parent.children(recursive=True)
                         if children:
-                            real_pid = children[0].pid
+                            # choose last child
+                            real_pid = children[-1].pid
                             break
                     except Exception:
                         pass
@@ -242,9 +344,15 @@ class OpenMSXFrontend:
                 pass
 
             # Persist status
-            self.db.set("openmsx_pid", str(real_pid))
+            try:
+                self.db.set("openmsx_pid", str(real_pid))
+            except Exception:
+                pass
             self.pid_var.set(f"PID: {real_pid}")
-            self.status_var.set(f"openMSX started: {exe_path} -machine {machine}")
+
+            # Update status string including extensions
+            ext_part = " ".join([f"-ext {e}" for e in exts]) if exts else ""
+            self.status_var.set(f"openMSX started: {exe_path} -machine {machine} {ext_part}".strip())
 
             # Socket path & UI update
             self._update_socket_button(real_pid)
@@ -255,7 +363,8 @@ class OpenMSXFrontend:
         temp_dir = os.getenv("TEMP") or os.getcwd()
         socket_path = os.path.join(temp_dir, "openmsx-default", f"socket.{pid}")
         self.current_socket_path = socket_path
-        self.socket_var.set(f"Socket: {socket_path}")
+        # Show socket on next line for readability
+        self.socket_var.set(f"Socket:\n{socket_path}")
 
         if hasattr(self, "btn_socket"):
             try:
@@ -264,7 +373,10 @@ class OpenMSXFrontend:
                 self.btn_socket.configure(state="normal", fg_color="green" if exists else "red")
             except Exception:
                 # fallback: enable but gray
-                self.btn_socket.configure(state="normal", fg_color="gray")
+                try:
+                    self.btn_socket.configure(state="normal", fg_color="gray")
+                except Exception:
+                    pass
 
     def _check_socket(self):
         path = self.current_socket_path
@@ -326,9 +438,9 @@ class OpenMSXFrontend:
                 messagebox.showerror("Not found", f"`openmsx.exe` not found at:\n{exe_path}")
                 return
             try:
-                # Save openmsx_dir and make DB path absolute if needed
                 self.db.set("openmsx_dir", path)
                 self._load_machines()
+                self._load_extensions()
                 self._update_status()
             except Exception as e:
                 messagebox.showerror("Save Error", f"Failed saving configuration:\n{e}")
@@ -367,16 +479,22 @@ class OpenMSXFrontend:
                 self._update_socket_button(pid_int)
             except (ValueError, TypeError):
                 self.pid_var.set("PID: invalid")
-                self.socket_var.set("Socket: -")
+                self.socket_var.set("Socket:\n-")
                 self.current_socket_path = None
                 if hasattr(self, "btn_socket"):
-                    self.btn_socket.configure(state="disabled", fg_color="gray")
+                    try:
+                        self.btn_socket.configure(state="disabled", fg_color="gray")
+                    except Exception:
+                        pass
         else:
             self.pid_var.set("PID: Not started")
-            self.socket_var.set("Socket: -")
+            self.socket_var.set("Socket:\n-")
             self.current_socket_path = None
             if hasattr(self, "btn_socket"):
-                self.btn_socket.configure(state="disabled", fg_color="gray")
+                try:
+                    self.btn_socket.configure(state="disabled", fg_color="gray")
+                except Exception:
+                    pass
 
         # Restore selected machine into combobox if present
         saved = self.db.get("openmsx_machine")
