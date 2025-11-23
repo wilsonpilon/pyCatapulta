@@ -5,6 +5,9 @@ import sqlite3
 import subprocess
 import sys
 import time
+import glob
+import socket
+import threading
 from pathlib import Path
 from typing import List, Optional
 
@@ -64,6 +67,219 @@ class DBManager:
             pass
 
 
+def find_port_from_temp() -> Optional[int]:
+    """
+    Locate the directory:
+      %LOCALAPPDATA%\Temp\openmsx-default
+    and read the most recently modified file. That file should contain the port number.
+    Returns int(port) or None.
+    """
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if not local_appdata:
+        return None
+    base = os.path.join(local_appdata, "Temp", "openmsx-default")
+    if not os.path.isdir(base):
+        return None
+    files = [f for f in glob.glob(os.path.join(base, "*")) if os.path.isfile(f)]
+    if not files:
+        return None
+    latest = max(files, key=os.path.getmtime)
+    try:
+        with open(latest, "r", encoding="utf-8", errors="ignore") as fh:
+            content = fh.read().strip()
+            return int(content)
+    except Exception:
+        return None
+
+
+class OpenMSXClientWindow:
+    """
+    Integrated TCP client window.
+    - Sends commands terminated by '\\n'.
+    - Reads responses by repeatedly receiving data until a short recv idle timeout occurs.
+    - Keeps a single socket per window and closes it on errors/exit.
+    """
+    def __init__(self, parent: ctk.CTk):
+        self.parent = parent
+        self.win = ctk.CTkToplevel(parent)
+        self.win.title("openMSX TCP Client")
+        self.win.geometry("900x520")
+        self.win.minsize(700, 420)
+        self.win.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.frame = ctk.CTkFrame(self.win, corner_radius=8)
+        self.frame.pack(fill="both", expand=True, padx=16, pady=16)
+
+        header = ctk.CTkLabel(self.frame, text="openMSX TCP Client", font=ctk.CTkFont(size=18, weight="bold"))
+        header.pack(pady=(6, 10))
+
+        self.input = ctk.CTkTextbox(master=self.frame, width=860, height=300)
+        self.input.insert("0.0", "# Digite o(s) comando(s) para openMSX aqui\n")
+        self.input.pack(padx=10, pady=(10, 8), fill="both", expand=False)
+
+        btn_row = ctk.CTkFrame(master=self.frame, fg_color="transparent")
+        btn_row.pack(fill="x", padx=10, pady=(0, 8))
+
+        self.send_btn = ctk.CTkButton(master=btn_row, text="Enviar", width=140, command=self.on_send)
+        self.send_btn.pack(side="left", padx=(0, 8))
+
+        self.close_btn = ctk.CTkButton(master=btn_row, text="Fechar", width=120, fg_color="red", hover_color="#ff6666", command=self.on_close)
+        self.close_btn.pack(side="left")
+
+        self.status = ctk.CTkLabel(master=self.frame, text="Status: inicializando...", anchor="w")
+        self.status.pack(fill="x", padx=10, pady=(6, 0))
+
+        self.resp = ctk.CTkTextbox(master=self.frame, width=860, height=120)
+        self.resp.insert("0.0", "Resposta do servidor:\n")
+        self.resp.configure(state="disabled")
+        self.resp.pack(padx=10, pady=(8, 10), fill="both", expand=True)
+
+        self.sock = None
+        self.sock_lock = threading.Lock()
+        self.tcp_port = None
+        self._stop = False
+
+        # Start background task to find port
+        threading.Thread(target=self._background_find_port, daemon=True).start()
+
+    def set_status(self, txt: str):
+        try:
+            self.status.configure(text=f"Status: {txt}")
+        except Exception:
+            pass
+
+    def append_response(self, txt: str):
+        def _append():
+            self.resp.configure(state="normal")
+            self.resp.insert("end", txt + "\n")
+            self.resp.see("end")
+            self.resp.configure(state="disabled")
+        try:
+            self.win.after(0, _append)
+        except Exception:
+            pass
+
+    def _background_find_port(self):
+        self.set_status("Procurando arquivo de porta em \\%LOCALAPPDATA\\%\\Temp\\openmsx-default ...")
+        for _ in range(12):
+            if self._stop:
+                return
+            p = find_port_from_temp()
+            if p:
+                self.tcp_port = p
+                self.set_status(f"Porta encontrada: {p}")
+                return
+            time.sleep(0.5)
+        self.set_status("Não encontrou arquivo de porta.")
+
+    def _ensure_connected(self) -> bool:
+        """
+        Ensure self.sock is connected. If missing, create new connection to found port.
+        Returns True if ready to send.
+        """
+        if self.tcp_port is None:
+            self.append_response("Porta não disponível.")
+            return False
+
+        with self.sock_lock:
+            if self.sock:
+                return True
+
+        try:
+            s = socket.create_connection(("127.0.0.1", self.tcp_port), timeout=3.0)
+            # Use a short recv timeout for responsive reads
+            s.settimeout(0.6)
+            with self.sock_lock:
+                self.sock = s
+            self.set_status(f"Conectado 127.0.0.1:{self.tcp_port}")
+            return True
+        except Exception as e:
+            self.append_response(f"Falha ao conectar TCP: {e}")
+            self.set_status("Conexão falhou")
+            return False
+
+    def _recv_all_until_quiet(self, s: socket.socket, idle_timeout: float = 0.25, max_total: float = 3.0) -> str:
+        """
+        Read repeatedly until no data arrives for `idle_timeout` seconds or `max_total` reached.
+        This tolerates multi-line replies from the server.
+        """
+        end_time = time.time() + max_total
+        parts = []
+        try:
+            s.settimeout(idle_timeout)
+            while time.time() < end_time:
+                try:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    parts.append(chunk)
+                except socket.timeout:
+                    break
+                except Exception:
+                    break
+        finally:
+            try:
+                s.settimeout(0.6)
+            except Exception:
+                pass
+        if parts:
+            try:
+                return b"".join(parts).decode("utf-8", errors="ignore").strip()
+            except Exception:
+                return "".join([p.decode("utf-8", errors="ignore") if isinstance(p, bytes) else str(p) for p in parts]).strip()
+        return ""
+
+    def send_command_thread(self, cmd: str):
+        if not self._ensure_connected():
+            return
+        with self.sock_lock:
+            s = self.sock
+        if not s:
+            self.append_response("Sem socket disponível.")
+            return
+        try:
+            if not cmd.endswith("\n"):
+                cmd += "\n"
+            s.sendall(cmd.encode("utf-8"))
+            reply = self._recv_all_until_quiet(s, idle_timeout=0.25, max_total=2.0)
+            if reply:
+                self.append_response(f"Resposta:\n{reply}")
+            else:
+                self.append_response("Comando enviado; sem resposta recebida (timeout).")
+        except Exception as e:
+            self.append_response(f"Erro ao enviar: {e}")
+            with self.sock_lock:
+                try:
+                    if self.sock:
+                        self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+            self.set_status("Conexão perdida")
+
+    def on_send(self):
+        text = self.input.get("0.0", "end").strip()
+        if not text:
+            self.append_response("Nada para enviar.")
+            return
+        self.set_status("Enviando...")
+        threading.Thread(target=self.send_command_thread, args=(text,), daemon=True).start()
+
+    def on_close(self):
+        self._stop = True
+        with self.sock_lock:
+            try:
+                if self.sock:
+                    self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
 class OpenMSXFrontend:
     def __init__(self):
         if sys.platform != "win32":
@@ -79,8 +295,8 @@ class OpenMSXFrontend:
 
         self.root = ctk.CTk()
         self.root.title("openMSX Frontend")
-        self.root.geometry("760x420")
-        self.root.minsize(640, 320)
+        self.root.geometry("1000x640")
+        self.root.minsize(800, 480)
 
         self.status_var = ctk.StringVar()
         self.pid_var = ctk.StringVar(value="PID: Not started")
@@ -96,6 +312,12 @@ class OpenMSXFrontend:
         self._load_machines()
         self._load_extensions()
         self._update_status()
+
+        # Start background port watcher to update Client TCP button color
+        try:
+            threading.Thread(target=self._start_port_watcher, daemon=True).start()
+        except Exception:
+            pass
 
         if not self.db.get("openmsx_dir"):
             self.open_config_window(initial=True)
@@ -116,6 +338,13 @@ class OpenMSXFrontend:
         btn_config = ctk.CTkButton(controls, text="Configuration", command=lambda: self.open_config_window(initial=False))
         btn_config.pack(side="left", padx=(0, 8))
 
+        # Button to open integrated TCP client window (store on self)
+        self.btn_client = ctk.CTkButton(controls, text="Client TCP", command=self.open_client_window, fg_color="gray")
+        self.btn_client.pack(side="left", padx=(0, 8))
+
+        btn_exit = ctk.CTkButton(controls, text="Exit", fg_color="red", hover_color="#cc6666", command=self._on_close)
+        btn_exit.pack(side="right", padx=(0, 8))
+
         # PID / Socket display
         info = ctk.CTkFrame(frame, corner_radius=0)
         info.pack(fill="x", pady=(12, 0), padx=8)
@@ -123,8 +352,7 @@ class OpenMSXFrontend:
         pid_label = ctk.CTkLabel(info, textvariable=self.pid_var, anchor="w", font=ctk.CTkFont(size=12, weight="bold"))
         pid_label.pack(fill="x", anchor="w")
 
-        # Socket on the next line for readability; allow wrapping
-        socket_label = ctk.CTkLabel(info, textvariable=self.socket_var, anchor="w", font=ctk.CTkFont(size=10), wraplength=720, justify="left")
+        socket_label = ctk.CTkLabel(info, textvariable=self.socket_var, anchor="w", font=ctk.CTkFont(size=10), wraplength=960, justify="left")
         socket_label.pack(fill="x", pady=(4, 0), anchor="w")
 
         # Machine combobox
@@ -134,34 +362,30 @@ class OpenMSXFrontend:
         machine_label = ctk.CTkLabel(machine_row, text="MSX Model:", anchor="w", font=ctk.CTkFont(size=12))
         machine_label.pack(side="left")
 
-        self.combo_machines = ctk.CTkComboBox(machine_row, values=[], variable=self.machine_var, width=420, command=self._on_machine_selected)
+        self.combo_machines = ctk.CTkComboBox(machine_row, values=[], variable=self.machine_var, width=600, command=self._on_machine_selected)
         self.combo_machines.pack(side="left", padx=(8, 0))
         self.combo_machines.configure(values=[], state="disabled")
 
-        # Inserir área de extensões abaixo do machine_row
+        # Extensions area
         ext_row = ctk.CTkFrame(frame, corner_radius=0)
         ext_row.pack(fill="both", pady=(12, 0), padx=8, expand=False)
 
         ext_label = ctk.CTkLabel(ext_row, text="Extensions:", anchor="w", font=ctk.CTkFont(size=12))
         ext_label.pack(anchor="w")
 
-        # Frame para listbox + scrollbar (usar widgets tk dentro do CTkFrame)
         list_frame = ctk.CTkFrame(ext_row, corner_radius=0)
         list_frame.pack(fill="both", pady=(6, 0), expand=True)
 
-        # listbox tkinter com seleção múltipla e altura 8
-        lb = tk.Listbox(list_frame, selectmode=tk.MULTIPLE, height=8, exportselection=False)
+        lb = tk.Listbox(list_frame, selectmode=tk.MULTIPLE, height=12, exportselection=False)
         lb.pack(side="left", fill="both", expand=True)
 
         sb = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=lb.yview)
         sb.pack(side="right", fill="y")
         lb.config(yscrollcommand=sb.set)
 
-        # armazenar referência e bind para salvar seleção quando mudar
         self.listbox_extensions = lb
         lb.bind("<<ListboxSelect>>", self._on_extensions_selected)
 
-        # Buttons area
         bottom = ctk.CTkFrame(frame, corner_radius=0)
         bottom.pack(fill="x", pady=(12, 0), padx=8)
 
@@ -178,7 +402,6 @@ class OpenMSXFrontend:
         return Path(openmsx_dir) / "share" / "extensions"
 
     def _get_machines(self) -> List[str]:
-        """Return sorted list of machine names (file stems) from share/machines."""
         openmsx_dir = self.db.get("openmsx_dir") or ""
         machines: List[str] = []
         if openmsx_dir:
@@ -189,7 +412,6 @@ class OpenMSXFrontend:
         return machines
 
     def _get_extensions(self) -> List[str]:
-        """Retorna nomes (sem .xml) das extensões em share/extensions."""
         openmsx_dir = self.db.get("openmsx_dir") or ""
         exts: List[str] = []
         if openmsx_dir:
@@ -208,12 +430,10 @@ class OpenMSXFrontend:
         self._machines_cache = machines
         if machines:
             self.combo_machines.configure(values=machines, state="normal")
-            # restore saved selection if valid
             saved = self.db.get("openmsx_machine")
             if saved and saved in machines:
                 self.machine_var.set(saved)
             else:
-                # default to first
                 self.machine_var.set(machines[0])
                 try:
                     self.db.set("openmsx_machine", machines[0])
@@ -228,7 +448,6 @@ class OpenMSXFrontend:
                 pass
 
     def _load_extensions(self):
-        """Preenche a listbox de extensões e restaura seleção do DB."""
         exts = self._get_extensions()
         self._extensions_cache = exts
 
@@ -239,7 +458,6 @@ class OpenMSXFrontend:
                 lb.insert(tk.END, item)
 
             if exts:
-                # restaurar seleção salva (JSON)
                 saved = self.db.get("openmsx_extensions")
                 try:
                     if saved:
@@ -256,7 +474,6 @@ class OpenMSXFrontend:
                 lb.configure(state="disabled")
 
     def _on_machine_selected(self, value: str):
-        """Called when user chooses a machine in the combobox."""
         try:
             if value:
                 self.db.set("openmsx_machine", value)
@@ -266,14 +483,12 @@ class OpenMSXFrontend:
             pass
 
     def _get_selected_extensions(self) -> List[str]:
-        """Retorna lista de nomes selecionados na listbox."""
         if not self.listbox_extensions:
             return []
         sel_idxs = self.listbox_extensions.curselection()
         return [self._extensions_cache[i] for i in sel_idxs if 0 <= i < len(self._extensions_cache)]
 
     def _on_extensions_selected(self, event=None):
-        """Salva seleção atual das extensões no DB."""
         selected = self._get_selected_extensions()
         try:
             self.db.set("openmsx_extensions", json.dumps(selected))
@@ -298,10 +513,8 @@ class OpenMSXFrontend:
             return
 
         try:
-            # Build command with -machine option and -ext for cada extensão selecionada
             cmd = [exe_path, "-machine", machine]
 
-            # anexar extensões selecionadas
             exts = self._get_selected_extensions()
             for e in exts:
                 cmd.extend(["-ext", e])
@@ -310,10 +523,9 @@ class OpenMSXFrontend:
             initial_pid = proc.pid
             real_pid = initial_pid
 
-            # Try to refine using psutil with a short retry loop to find the actual openmsx.exe process
             try:
                 import psutil
-                deadline = time.time() + 2.0  # up to 2 seconds
+                deadline = time.time() + 2.0
                 while time.time() < deadline:
                     matches = []
                     for p in psutil.process_iter(['pid', 'exe', 'ppid']):
@@ -326,12 +538,10 @@ class OpenMSXFrontend:
                     if matches:
                         real_pid = matches[-1]
                         break
-                    # fallback: check children of initial process
                     try:
                         parent = psutil.Process(initial_pid)
                         children = parent.children(recursive=True)
                         if children:
-                            # choose last child
                             real_pid = children[-1].pid
                             break
                     except Exception:
@@ -343,18 +553,15 @@ class OpenMSXFrontend:
             except Exception:
                 pass
 
-            # Persist status
             try:
                 self.db.set("openmsx_pid", str(real_pid))
             except Exception:
                 pass
             self.pid_var.set(f"PID: {real_pid}")
 
-            # Update status string including extensions
             ext_part = " ".join([f"-ext {e}" for e in exts]) if exts else ""
             self.status_var.set(f"openMSX started: {exe_path} -machine {machine} {ext_part}".strip())
 
-            # Socket path & UI update
             self._update_socket_button(real_pid)
         except Exception as e:
             messagebox.showerror("Start Error", f"Failed to start openMSX:\n{e}")
@@ -363,16 +570,13 @@ class OpenMSXFrontend:
         temp_dir = os.getenv("TEMP") or os.getcwd()
         socket_path = os.path.join(temp_dir, "openmsx-default", f"socket.{pid}")
         self.current_socket_path = socket_path
-        # Show socket on next line for readability
         self.socket_var.set(f"Socket:\n{socket_path}")
 
         if hasattr(self, "btn_socket"):
             try:
                 exists = os.path.exists(socket_path)
-                # enable button even if not present, color indicates presence
                 self.btn_socket.configure(state="normal", fg_color="green" if exists else "red")
             except Exception:
-                # fallback: enable but gray
                 try:
                     self.btn_socket.configure(state="normal", fg_color="gray")
                 except Exception:
@@ -385,10 +589,8 @@ class OpenMSXFrontend:
             return
         if os.path.exists(path):
             try:
-                # Use explorer to select the file
                 subprocess.Popen(['explorer', f'/select,{path}'])
             except Exception:
-                # fallback: open folder
                 try:
                     os.startfile(os.path.dirname(path))
                 except Exception as e:
@@ -496,10 +698,22 @@ class OpenMSXFrontend:
                 except Exception:
                     pass
 
-        # Restore selected machine into combobox if present
         saved = self.db.get("openmsx_machine")
         if saved and saved in self._machines_cache:
             self.machine_var.set(saved)
+
+    def open_client_window(self):
+        try:
+            if getattr(self, "_client_window", None):
+                try:
+                    if self._client_window.win.winfo_exists():
+                        self._client_window.win.lift()
+                        return
+                except Exception:
+                    pass
+            self._client_window = OpenMSXClientWindow(self.root)
+        except Exception as e:
+            messagebox.showerror("Client Error", f"Cannot open client window:\n{e}")
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -510,6 +724,44 @@ class OpenMSXFrontend:
             self.db.close()
         finally:
             self.root.destroy()
+
+    def _check_local_port(self, port: int) -> bool:
+        """Return True if a TCP connection to localhost:port can be established quickly."""
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return True
+        except Exception:
+            return False
+
+    def _start_port_watcher(self, interval: float = 2.0):
+        """
+        Background loop: read the port file and test connection.
+        Updates `Client TCP` button color on the GUI thread:
+          - green if connection succeeds
+          - gray if no open port found or connection fails
+        """
+        while True:
+            try:
+                port = find_port_from_temp()
+                is_open = False
+                if port:
+                    is_open = self._check_local_port(port)
+
+                def _update_button(opened=is_open):
+                    try:
+                        if hasattr(self, "btn_client"):
+                            color = "green" if opened else "gray"
+                            self.btn_client.configure(fg_color=color)
+                    except Exception:
+                        pass
+
+                try:
+                    self.root.after(0, _update_button)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            time.sleep(interval)
 
 
 if __name__ == "__main__":

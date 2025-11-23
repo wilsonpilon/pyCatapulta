@@ -13,7 +13,9 @@ or for Windows:
 openmsx -control pipe
 The second method is using a socket. Connecting on non-Windows systems is done with a UNIX domain socket. openMSX puts the socket in /tmp/openmsx-<username>/socket.<pid>. The /tmp/ dir can be overridden by environment variables TMPDIR, TMP or TEMP (in that order).
 
-On Windows (which does not support UNIX domain sockets), the socket is a normal TCP socket. The port number is random between 9938 and 9958. This is done to enforce applications to deal with multiple running openMSX processes. The port number will be put in the following text file:
+On Windows (which does not support UNIX domain sockets), the socket is a normal TCP socket. The port number is random between
+9938 and 9958. This is done to enforce applications to deal with multiple running openMSX processes.
+The port number will be put in the following text file:
 
 %USERPROFILE%\Documents and Settings\<username>\Local Settings\Temp\openmsx-default\socket.<pid>
 or, when %USERPROFILE% does not exist:
@@ -26,17 +28,24 @@ C:\WINDOWS\TEMP
 After connecting, openMSX expects XML input on the channel and it will also give you output. This is explained in the next section.
 
 Communication
-After connecting, openMSX expects XML input on the channel (pipe or socket) and it will also give you output in XML format. The first output it gives is this:
+After connecting, openMSX expects XML input on the channel (pipe or socket)
+and it will also give you output in XML format. The first output it gives is this:
 
 <openmsx-output>
-On non-Windows systems you can easily try it out by just starting openMSX via the stdio method, as explained above. You give XML commands via the keyboard in the terminal and openMSX will print its responses on the terminal as well.
+On non-Windows systems you can easily try it out by just starting openMSX via the stdio method,
+as explained above. You give XML commands via the keyboard in the terminal and openMSX will print its
+responses on the terminal as well.
 
-This first output is the opening tag (<openmsx-output>). All messages that are normally printed on stdout in the terminal from which you start openMSX are in a <log> tag. The level can be "info" or "warning" and the message is in the text node itself.
+This first output is the opening tag (<openmsx-output>).
+All messages that are normally printed on stdout in the terminal from which you start openMSX
+are in a <log> tag. The level can be "info" or "warning" and the message is in the text node itself.
 
 When you want to start communicating back, you always have to start with the opening tag first:
 
 <openmsx-control>
-When starting openMSX with the -control option, it will not show a window: it starts with the 'none' renderer. So, a nice example (if you're still experimenting on the command line) would be to type this:
+When starting openMSX with the -control option, it will not show a window:
+ it starts with the 'none' renderer. So, a nice example (if you're still
+  experimenting on the command line) would be to type this:
 
 <command>set renderer SDL</command>
 With the <command> tag you can give any openMSX console command to openMSX. The commands are documented in the Console Commands Reference.
