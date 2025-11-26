@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 
 # Application directories and config
@@ -20,6 +20,7 @@ APP_DIR = Path(os.getenv("APPDATA") or Path.home()) / "openmsx_frontend"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = APP_DIR / "app_config.json"
 DEFAULT_DB = str(APP_DIR / "app_data.db")
+MAX_HISTORY = 20
 
 
 def ensure_config_file():
@@ -34,15 +35,11 @@ def load_config() -> dict:
 
 
 class DBManager:
-    """Simple SQLite config storage. Uses `INSERT OR REPLACE` for compatibility."""
+    """Simple SQLite config storage."""
     def __init__(self, db_path: str):
         self.db_path = str(Path(db_path).resolve())
-        try:
-            self.conn = sqlite3.connect(self.db_path, timeout=5)
-            self._ensure_table()
-        except Exception as e:
-            messagebox.showerror("DB Error", f"Failed opening DB `{self.db_path}`:\n{e}")
-            raise
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._ensure_table()
 
     def _ensure_table(self):
         cur = self.conn.cursor()
@@ -67,37 +64,9 @@ class DBManager:
             pass
 
 
-def find_port_from_temp() -> Optional[int]:
-    """
-    Locate the directory:
-      %LOCALAPPDATA%\Temp\openmsx-default
-    and read the most recently modified file. That file should contain the port number.
-    Returns int(port) or None.
-    """
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if not local_appdata:
-        return None
-    base = os.path.join(local_appdata, "Temp", "openmsx-default")
-    if not os.path.isdir(base):
-        return None
-    files = [f for f in glob.glob(os.path.join(base, "*")) if os.path.isfile(f)]
-    if not files:
-        return None
-    latest = max(files, key=os.path.getmtime)
-    try:
-        with open(latest, "r", encoding="utf-8", errors="ignore") as fh:
-            content = fh.read().strip()
-            return int(content)
-    except Exception:
-        return None
-
-
 class OpenMSXClientWindow:
     """
-    Integrated TCP client window.
-    - Sends commands terminated by '\\n'.
-    - Reads responses by repeatedly receiving data until a short recv idle timeout occurs.
-    - Keeps a single socket per window and closes it on errors/exit.
+    Simple integrated TCP client to connect to openMSX TCP port (if available).
     """
     def __init__(self, parent: ctk.CTk):
         self.parent = parent
@@ -139,7 +108,6 @@ class OpenMSXClientWindow:
         self.tcp_port = None
         self._stop = False
 
-        # Start background task to find port
         threading.Thread(target=self._background_find_port, daemon=True).start()
 
     def set_status(self, txt: str):
@@ -150,10 +118,13 @@ class OpenMSXClientWindow:
 
     def append_response(self, txt: str):
         def _append():
-            self.resp.configure(state="normal")
-            self.resp.insert("end", txt + "\n")
-            self.resp.see("end")
-            self.resp.configure(state="disabled")
+            try:
+                self.resp.configure(state="normal")
+                self.resp.insert("end", txt + "\n")
+                self.resp.see("end")
+                self.resp.configure(state="disabled")
+            except Exception:
+                pass
         try:
             self.win.after(0, _append)
         except Exception:
@@ -164,70 +135,53 @@ class OpenMSXClientWindow:
         for _ in range(12):
             if self._stop:
                 return
-            p = find_port_from_temp()
-            if p:
-                self.tcp_port = p
-                self.set_status(f"Porta encontrada: {p}")
+            port = find_port_from_temp()
+            if port:
+                self.tcp_port = port
+                self.set_status(f"Porta encontrada: {port}")
                 return
-            time.sleep(0.5)
+            time.sleep(1.0)
         self.set_status("Não encontrou arquivo de porta.")
 
     def _ensure_connected(self) -> bool:
-        """
-        Ensure self.sock is connected. If missing, create new connection to found port.
-        Returns True if ready to send.
-        """
         if self.tcp_port is None:
-            self.append_response("Porta não disponível.")
+            self.set_status("Porta desconhecida.")
             return False
-
         with self.sock_lock:
             if self.sock:
                 return True
-
-        try:
-            s = socket.create_connection(("127.0.0.1", self.tcp_port), timeout=3.0)
-            # Use a short recv timeout for responsive reads
-            s.settimeout(0.6)
-            with self.sock_lock:
+            try:
+                s = socket.create_connection(("127.0.0.1", int(self.tcp_port)), timeout=1.5)
                 self.sock = s
-            self.set_status(f"Conectado 127.0.0.1:{self.tcp_port}")
-            return True
-        except Exception as e:
-            self.append_response(f"Falha ao conectar TCP: {e}")
-            self.set_status("Conexão falhou")
-            return False
+                self.set_status(f"Conectado a {self.tcp_port}")
+                return True
+            except Exception as e:
+                self.set_status(f"Falha conectar: {e}")
+                self.sock = None
+                return False
 
     def _recv_all_until_quiet(self, s: socket.socket, idle_timeout: float = 0.25, max_total: float = 3.0) -> str:
-        """
-        Read repeatedly until no data arrives for `idle_timeout` seconds or `max_total` reached.
-        This tolerates multi-line replies from the server.
-        """
         end_time = time.time() + max_total
         parts = []
+        s.setblocking(False)
         try:
-            s.settimeout(idle_timeout)
             while time.time() < end_time:
                 try:
                     chunk = s.recv(4096)
-                    if not chunk:
-                        break
-                    parts.append(chunk)
-                except socket.timeout:
-                    break
-                except Exception:
-                    break
+                    if chunk:
+                        parts.append(chunk.decode(errors="ignore"))
+                        # extend end_time a little to allow more data
+                        end_time = max(end_time, time.time() + idle_timeout)
+                    else:
+                        time.sleep(0.05)
+                except BlockingIOError:
+                    time.sleep(0.05)
         finally:
             try:
-                s.settimeout(0.6)
+                s.setblocking(True)
             except Exception:
                 pass
-        if parts:
-            try:
-                return b"".join(parts).decode("utf-8", errors="ignore").strip()
-            except Exception:
-                return "".join([p.decode("utf-8", errors="ignore") if isinstance(p, bytes) else str(p) for p in parts]).strip()
-        return ""
+        return "".join(parts)
 
     def send_command_thread(self, cmd: str):
         if not self._ensure_connected():
@@ -235,32 +189,29 @@ class OpenMSXClientWindow:
         with self.sock_lock:
             s = self.sock
         if not s:
-            self.append_response("Sem socket disponível.")
             return
         try:
-            if not cmd.endswith("\n"):
-                cmd += "\n"
-            s.sendall(cmd.encode("utf-8"))
-            reply = self._recv_all_until_quiet(s, idle_timeout=0.25, max_total=2.0)
-            if reply:
-                self.append_response(f"Resposta:\n{reply}")
-            else:
-                self.append_response("Comando enviado; sem resposta recebida (timeout).")
+            data = cmd.strip()
+            if not data.endswith("\n"):
+                data += "\n"
+            s.sendall(data.encode("utf-8"))
+            resp = self._recv_all_until_quiet(s)
+            self.append_response(resp or "<no response>")
+            self.set_status("Comando enviado.")
         except Exception as e:
-            self.append_response(f"Erro ao enviar: {e}")
-            with self.sock_lock:
-                try:
+            self.append_response(f"<error: {e}>")
+            try:
+                with self.sock_lock:
                     if self.sock:
                         self.sock.close()
-                except Exception:
-                    pass
-                self.sock = None
-            self.set_status("Conexão perdida")
+                    self.sock = None
+            except Exception:
+                pass
 
     def on_send(self):
         text = self.input.get("0.0", "end").strip()
         if not text:
-            self.append_response("Nada para enviar.")
+            self.set_status("Nada para enviar.")
             return
         self.set_status("Enviando...")
         threading.Thread(target=self.send_command_thread, args=(text,), daemon=True).start()
@@ -283,15 +234,34 @@ class OpenMSXClientWindow:
 class OpenMSXFrontend:
     def __init__(self):
         if sys.platform != "win32":
-            messagebox.showerror("Unsupported platform", "This program runs only on Windows.")
+            messagebox.showerror("Platform", "This frontend runs on Windows only.")
             sys.exit(1)
 
+        # initial theme defaults (can be overridden by DB)
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
 
         cfg = load_config()
         db_path = cfg.get("db_path", DEFAULT_DB)
         self.db = DBManager(db_path)
+
+        # apply saved UI theme and other settings early
+        saved_theme = (self.db.get("ui_theme") or "Light")
+        if saved_theme == "Green":
+            ctk.set_appearance_mode("Light")
+            try:
+                ctk.set_default_color_theme("green")
+            except Exception:
+                ctk.set_default_color_theme("blue")
+        elif saved_theme == "Dark":
+            ctk.set_appearance_mode("Dark")
+            ctk.set_default_color_theme("blue")
+        else:
+            ctk.set_appearance_mode("Light")
+            ctk.set_default_color_theme("blue")
+
+        self.file_hunter_url = self.db.get("file_hunter_url") or "https://download.file-hunter.com/"
+        self.msx_default_dir = self.db.get("msx_default_dir") or r"C:\msx"
 
         self.root = ctk.CTk()
         self.root.title("openMSX Frontend")
@@ -303,6 +273,42 @@ class OpenMSXFrontend:
         self.socket_var = ctk.StringVar(value="Socket:\n-")
         self.machine_var = ctk.StringVar(value="")
         self.current_socket_path: Optional[str] = None
+
+        # Disk A/B mode and history
+        self.disk_a_mode = self.db.get("disk_a_mode") or "image"  # "image" or "directory"
+        try:
+            self.disk_a_history = json.loads(self.db.get("disk_a_history") or "[]")
+            if not isinstance(self.disk_a_history, list):
+                self.disk_a_history = []
+        except Exception:
+            self.disk_a_history = []
+        self.disk_a_var = tk.StringVar(value="")
+
+        self.disk_b_mode = self.db.get("disk_b_mode") or "image"
+        try:
+            self.disk_b_history = json.loads(self.db.get("disk_b_history") or "[]")
+            if not isinstance(self.disk_b_history, list):
+                self.disk_b_history = []
+        except Exception:
+            self.disk_b_history = []
+        self.disk_b_var = tk.StringVar(value="")
+
+        # Cartridge A/B history
+        try:
+            self.cart_a_history = json.loads(self.db.get("cart_a_history") or "[]")
+            if not isinstance(self.cart_a_history, list):
+                self.cart_a_history = []
+        except Exception:
+            self.cart_a_history = []
+        self.cart_a_var = tk.StringVar(value="")
+
+        try:
+            self.cart_b_history = json.loads(self.db.get("cart_b_history") or "[]")
+            if not isinstance(self.cart_b_history, list):
+                self.cart_b_history = []
+        except Exception:
+            self.cart_b_history = []
+        self.cart_b_var = tk.StringVar(value="")
 
         self._machines_cache: List[str] = []
         self._extensions_cache: List[str] = []
@@ -320,6 +326,7 @@ class OpenMSXFrontend:
             pass
 
         if not self.db.get("openmsx_dir"):
+            # prompt configuration at startup
             self.open_config_window(initial=True)
 
     def _build_main_ui(self):
@@ -366,6 +373,86 @@ class OpenMSXFrontend:
         self.combo_machines.pack(side="left", padx=(8, 0))
         self.combo_machines.configure(values=[], state="disabled")
 
+        # Disk A media row
+        media_row = ctk.CTkFrame(frame, corner_radius=0)
+        media_row.pack(fill="x", pady=(12, 0), padx=8)
+
+        media_label = ctk.CTkLabel(media_row, text="Disk A:", anchor="w", font=ctk.CTkFont(size=12))
+        media_label.pack(side="left")
+
+        # Use ttk.Combobox (editable) for path history + manual entry
+        self.disk_a_combobox = ttk.Combobox(media_row, textvariable=self.disk_a_var, values=self.disk_a_history, width=80)
+        self.disk_a_combobox.pack(side="left", padx=(8, 6), fill="x", expand=True)
+        self.disk_a_combobox.state(["!readonly"])  # make editable
+
+        # Browse button (disk icon)
+        self.btn_disk_browse = ctk.CTkButton(media_row, text="💾", width=40, command=self._browse_disk_a)
+        self.btn_disk_browse.pack(side="left", padx=(6, 6))
+
+        # Eject button (eject icon)
+        self.btn_disk_eject = ctk.CTkButton(media_row, text="⏏️ Eject", width=100, fg_color="#ff6666", hover_color="#ff8888", command=self._eject_disk_a)
+        self.btn_disk_eject.pack(side="left", padx=(6, 6))
+
+        # Options button to open the small listbox (image/default or directory)
+        self.btn_disk_options = ctk.CTkButton(media_row, text="Options ▾", width=110, command=self._open_disk_a_options)
+        self.btn_disk_options.pack(side="left", padx=(6, 0))
+
+        # Disk B media row (mirror of Disk A)
+        media_row_b = ctk.CTkFrame(frame, corner_radius=0)
+        media_row_b.pack(fill="x", pady=(6, 0), padx=8)
+
+        media_label_b = ctk.CTkLabel(media_row_b, text="Disk B:", anchor="w", font=ctk.CTkFont(size=12))
+        media_label_b.pack(side="left")
+
+        self.disk_b_combobox = ttk.Combobox(media_row_b, textvariable=self.disk_b_var, values=self.disk_b_history, width=80)
+        self.disk_b_combobox.pack(side="left", padx=(8, 6), fill="x", expand=True)
+        self.disk_b_combobox.state(["!readonly"])
+
+        self.btn_disk_b_browse = ctk.CTkButton(media_row_b, text="💾", width=40, command=self._browse_disk_b)
+        self.btn_disk_b_browse.pack(side="left", padx=(6, 6))
+
+        self.btn_disk_b_eject = ctk.CTkButton(media_row_b, text="⏏️ Eject", width=100, fg_color="#ff6666", hover_color="#ff8888", command=self._eject_disk_b)
+        self.btn_disk_b_eject.pack(side="left", padx=(6, 6))
+
+        self.btn_disk_b_options = ctk.CTkButton(media_row_b, text="Options ▾", width=110, command=self._open_disk_b_options)
+        self.btn_disk_b_options.pack(side="left", padx=(6, 0))
+
+        # Cartridge A row (similar to Disk rows)
+        cart_row = ctk.CTkFrame(frame, corner_radius=0)
+        cart_row.pack(fill="x", pady=(12, 0), padx=8)
+
+        cart_label = ctk.CTkLabel(cart_row, text="Cart A:", anchor="w", font=ctk.CTkFont(size=12))
+        cart_label.pack(side="left")
+
+        self.cart_a_combobox = ttk.Combobox(cart_row, textvariable=self.cart_a_var, values=self.cart_a_history, width=80)
+        self.cart_a_combobox.pack(side="left", padx=(8, 6), fill="x", expand=True)
+        self.cart_a_combobox.state(["!readonly"])
+
+        # Browse button (cart icon)
+        self.btn_cart_a_browse = ctk.CTkButton(cart_row, text="🎮", width=40, command=self._browse_cart_a)
+        self.btn_cart_a_browse.pack(side="left", padx=(6, 6))
+
+        # Eject button
+        self.btn_cart_a_eject = ctk.CTkButton(cart_row, text="⏏️ Eject", width=100, fg_color="#ff6666", hover_color="#ff8888", command=self._eject_cart_a)
+        self.btn_cart_a_eject.pack(side="left", padx=(6, 6))
+
+        # Cartridge B row
+        cart_row_b = ctk.CTkFrame(frame, corner_radius=0)
+        cart_row_b.pack(fill="x", pady=(6, 0), padx=8)
+
+        cart_label_b = ctk.CTkLabel(cart_row_b, text="Cart B:", anchor="w", font=ctk.CTkFont(size=12))
+        cart_label_b.pack(side="left")
+
+        self.cart_b_combobox = ttk.Combobox(cart_row_b, textvariable=self.cart_b_var, values=self.cart_b_history, width=80)
+        self.cart_b_combobox.pack(side="left", padx=(8, 6), fill="x", expand=True)
+        self.cart_b_combobox.state(["!readonly"])
+
+        self.btn_cart_b_browse = ctk.CTkButton(cart_row_b, text="🎮", width=40, command=self._browse_cart_b)
+        self.btn_cart_b_browse.pack(side="left", padx=(6, 6))
+
+        self.btn_cart_b_eject = ctk.CTkButton(cart_row_b, text="⏏️ Eject", width=100, fg_color="#ff6666", hover_color="#ff8888", command=self._eject_cart_b)
+        self.btn_cart_b_eject.pack(side="left", padx=(6, 6))
+
         # Extensions area
         ext_row = ctk.CTkFrame(frame, corner_radius=0)
         ext_row.pack(fill="both", pady=(12, 0), padx=8, expand=False)
@@ -395,6 +482,202 @@ class OpenMSXFrontend:
         status_label = ctk.CTkLabel(bottom, textvariable=self.status_var)
         status_label.pack(side="left", padx=(8, 0))
 
+        # initialize display of disk mode in options buttons
+        self._update_disk_options_button_text()
+
+    def _update_disk_options_button_text(self):
+        try:
+            self.btn_disk_options.configure(text=f"Mode: {self.disk_a_mode} ▾")
+            self.btn_disk_b_options.configure(text=f"Mode: {self.disk_b_mode} ▾")
+        except Exception:
+            pass
+
+    def _browse_disk_a(self):
+        try:
+            if self.disk_a_mode == "directory":
+                sel = filedialog.askdirectory(title="Select Disk A directory")
+                if sel:
+                    self.disk_a_var.set(sel)
+                    self._add_disk_a_history(sel)
+                    self.db.set("disk_a_current", sel)
+            else:
+                sel = filedialog.askopenfilename(title="Select Disk A image", filetypes=[("Disk images", "*.dsk *.img *.zip *.vhd *.iso"), ("All files", "*.*")])
+                if sel:
+                    self.disk_a_var.set(sel)
+                    self._add_disk_a_history(sel)
+                    self.db.set("disk_a_current", sel)
+        except Exception as e:
+            messagebox.showerror("Browse Disk A", str(e))
+
+    def _eject_disk_a(self):
+        try:
+            self.disk_a_var.set("")
+            self.db.set("disk_a_current", "")
+        except Exception:
+            pass
+
+    def _open_disk_a_options(self):
+        try:
+            win = ctk.CTkToplevel(self.root)
+            win.title("Disk A Options")
+            win.geometry("320x160")
+            win.grab_set()
+
+            var = tk.StringVar(value=self.disk_a_mode)
+            r1 = ctk.CTkRadioButton(win, text="Image file", variable=var, value="image")
+            r1.pack(anchor="w", padx=12, pady=8)
+            r2 = ctk.CTkRadioButton(win, text="Directory", variable=var, value="directory")
+            r2.pack(anchor="w", padx=12, pady=8)
+
+            def do_save():
+                self.disk_a_mode = var.get()
+                self.db.set("disk_a_mode", self.disk_a_mode)
+                self._update_disk_options_button_text()
+                win.destroy()
+
+            btn = ctk.CTkButton(win, text="Save", command=do_save)
+            btn.pack(pady=8)
+        except Exception as e:
+            messagebox.showerror("Disk A Options", str(e))
+
+    def _add_disk_a_history(self, path: str):
+        try:
+            if not path:
+                return
+            if path in self.disk_a_history:
+                self.disk_a_history.remove(path)
+            self.disk_a_history.insert(0, path)
+            self.disk_a_history = self.disk_a_history[:MAX_HISTORY]
+            self.db.set("disk_a_history", json.dumps(self.disk_a_history))
+            self.disk_a_combobox['values'] = self.disk_a_history
+        except Exception:
+            pass
+
+    def _browse_disk_b(self):
+        try:
+            if self.disk_b_mode == "directory":
+                sel = filedialog.askdirectory(title="Select Disk B directory")
+                if sel:
+                    self.disk_b_var.set(sel)
+                    self._add_disk_b_history(sel)
+                    self.db.set("disk_b_current", sel)
+            else:
+                sel = filedialog.askopenfilename(title="Select Disk B image", filetypes=[("Disk images", "*.dsk *.img *.zip *.vhd *.iso"), ("All files", "*.*")])
+                if sel:
+                    self.disk_b_var.set(sel)
+                    self._add_disk_b_history(sel)
+                    self.db.set("disk_b_current", sel)
+        except Exception as e:
+            messagebox.showerror("Browse Disk B", str(e))
+
+    def _eject_disk_b(self):
+        try:
+            self.disk_b_var.set("")
+            self.db.set("disk_b_current", "")
+        except Exception:
+            pass
+
+    def _open_disk_b_options(self):
+        try:
+            win = ctk.CTkToplevel(self.root)
+            win.title("Disk B Options")
+            win.geometry("320x160")
+            win.grab_set()
+
+            var = tk.StringVar(value=self.disk_b_mode)
+            r1 = ctk.CTkRadioButton(win, text="Image file", variable=var, value="image")
+            r1.pack(anchor="w", padx=12, pady=8)
+            r2 = ctk.CTkRadioButton(win, text="Directory", variable=var, value="directory")
+            r2.pack(anchor="w", padx=12, pady=8)
+
+            def do_save():
+                self.disk_b_mode = var.get()
+                self.db.set("disk_b_mode", self.disk_b_mode)
+                self._update_disk_options_button_text()
+                win.destroy()
+
+            btn = ctk.CTkButton(win, text="Save", command=do_save)
+            btn.pack(pady=8)
+        except Exception as e:
+            messagebox.showerror("Disk B Options", str(e))
+
+    def _add_disk_b_history(self, path: str):
+        try:
+            if not path:
+                return
+            if path in self.disk_b_history:
+                self.disk_b_history.remove(path)
+            self.disk_b_history.insert(0, path)
+            self.disk_b_history = self.disk_b_history[:MAX_HISTORY]
+            self.db.set("disk_b_history", json.dumps(self.disk_b_history))
+            self.disk_b_combobox['values'] = self.disk_b_history
+        except Exception:
+            pass
+
+    def _browse_cart_a(self):
+        """Open file dialog to select a cartridge image for Cart A (.rom / .zip)."""
+        try:
+            sel = filedialog.askopenfilename(title="Select Cart A ROM", filetypes=[("ROMs and zips", "*.rom *.zip *.bin"), ("All files", "*.*")])
+            if sel:
+                self.cart_a_var.set(sel)
+                self._add_cart_a_history(sel)
+                self.db.set("cart_a_current", sel)
+        except Exception as e:
+            messagebox.showerror("Browse Cart A", str(e))
+
+    def _eject_cart_a(self):
+        """Eject Cart A: clear field and persist empty current."""
+        try:
+            self.cart_a_var.set("")
+            self.db.set("cart_a_current", "")
+        except Exception:
+            pass
+
+    def _add_cart_a_history(self, path: str):
+        try:
+            if not path:
+                return
+            if path in self.cart_a_history:
+                self.cart_a_history.remove(path)
+            self.cart_a_history.insert(0, path)
+            self.cart_a_history = self.cart_a_history[:MAX_HISTORY]
+            self.db.set("cart_a_history", json.dumps(self.cart_a_history))
+            self.cart_a_combobox['values'] = self.cart_a_history
+        except Exception:
+            pass
+
+    def _browse_cart_b(self):
+        """Open file dialog to select a cartridge image for Cart B (.rom / .zip)."""
+        try:
+            sel = filedialog.askopenfilename(title="Select Cart B ROM", filetypes=[("ROMs and zips", "*.rom *.zip *.bin"), ("All files", "*.*")])
+            if sel:
+                self.cart_b_var.set(sel)
+                self._add_cart_b_history(sel)
+                self.db.set("cart_b_current", sel)
+        except Exception as e:
+            messagebox.showerror("Browse Cart B", str(e))
+
+    def _eject_cart_b(self):
+        """Eject Cart B: clear field and persist empty current."""
+        try:
+            self.cart_b_var.set("")
+            self.db.set("cart_b_current", "")
+        except Exception:
+            pass
+
+    def _add_cart_b_history(self, path: str):
+        try:
+            if not path:
+                return
+            if path in self.cart_b_history:
+                self.cart_b_history.remove(path)
+            self.cart_b_history.insert(0, path)
+            self.cart_b_history = self.cart_b_history[:MAX_HISTORY]
+            self.db.set("cart_b_history", json.dumps(self.cart_b_history))
+            self.cart_b_combobox['values'] = self.cart_b_history
+        except Exception:
+            pass
+
     def _machines_dir(self, openmsx_dir: str) -> Path:
         return Path(openmsx_dir) / "share" / "machines"
 
@@ -405,80 +688,60 @@ class OpenMSXFrontend:
         openmsx_dir = self.db.get("openmsx_dir") or ""
         machines: List[str] = []
         if openmsx_dir:
-            p = self._machines_dir(openmsx_dir)
-            if p.exists() and p.is_dir():
-                for f in sorted(p.glob("*.xml")):
-                    machines.append(f.stem)
+            md = self._machines_dir(openmsx_dir)
+            if md.is_dir():
+                for child in sorted(md.iterdir()):
+                    if child.is_file():
+                        machines.append(child.stem)
+                    elif child.is_dir():
+                        machines.append(child.name)
         return machines
 
     def _get_extensions(self) -> List[str]:
         openmsx_dir = self.db.get("openmsx_dir") or ""
         exts: List[str] = []
         if openmsx_dir:
-            p = self._extensions_dir(openmsx_dir)
-            if p.exists() and p.is_dir():
-                for f in sorted(p.iterdir()):
-                    try:
-                        if f.is_file() and f.suffix.lower() == ".xml":
-                            exts.append(f.stem)
-                    except Exception:
-                        continue
+            ed = self._extensions_dir(openmsx_dir)
+            if ed.is_dir():
+                for child in sorted(ed.iterdir()):
+                    if child.is_dir() or child.suffix:
+                        exts.append(child.name)
         return exts
 
     def _load_machines(self):
         machines = self._get_machines()
         self._machines_cache = machines
         if machines:
-            self.combo_machines.configure(values=machines, state="normal")
-            saved = self.db.get("openmsx_machine")
-            if saved and saved in machines:
-                self.machine_var.set(saved)
-            else:
-                self.machine_var.set(machines[0])
-                try:
-                    self.db.set("openmsx_machine", machines[0])
-                except Exception:
-                    pass
-        else:
-            self.combo_machines.configure(values=[], state="disabled")
-            self.machine_var.set("")
             try:
-                self.db.set("openmsx_machine", "")
+                self.combo_machines.configure(values=machines, state="normal")
+                saved = self.db.get("openmsx_machine") or ""
+                if saved and saved in machines:
+                    self.machine_var.set(saved)
             except Exception:
                 pass
+        else:
+            self.combo_machines.configure(values=[], state="disabled")
 
     def _load_extensions(self):
         exts = self._get_extensions()
         self._extensions_cache = exts
-
         if self.listbox_extensions:
-            lb = self.listbox_extensions
-            lb.delete(0, tk.END)
-            for item in exts:
-                lb.insert(tk.END, item)
-
-            if exts:
-                saved = self.db.get("openmsx_extensions")
-                try:
-                    if saved:
-                        sel = json.loads(saved)
-                        if isinstance(sel, list):
-                            lb.selection_clear(0, tk.END)
-                            for i, name in enumerate(exts):
-                                if name in sel:
-                                    lb.selection_set(i)
-                except Exception:
-                    pass
-                lb.configure(state="normal")
-            else:
-                lb.configure(state="disabled")
+            self.listbox_extensions.delete(0, "end")
+            for e in exts:
+                self.listbox_extensions.insert("end", e)
+            # restore selection
+            try:
+                saved = json.loads(self.db.get("openmsx_extensions") or "[]")
+                for i, name in enumerate(exts):
+                    if name in saved:
+                        self.listbox_extensions.selection_set(i)
+            except Exception:
+                pass
 
     def _on_machine_selected(self, value: str):
         try:
             if value:
                 self.db.set("openmsx_machine", value)
-            else:
-                self.db.set("openmsx_machine", "")
         except Exception:
             pass
 
@@ -498,73 +761,29 @@ class OpenMSXFrontend:
     def start_openmsx(self):
         dir_path = self.db.get("openmsx_dir")
         if not dir_path:
-            messagebox.showerror("Error", "openMSX directory not configured.")
+            messagebox.showerror("Start", "openMSX directory not configured.")
             return
 
         exe_path = str(Path(dir_path) / "openmsx.exe")
         if not Path(exe_path).is_file():
-            messagebox.showerror("Error", f"`openmsx.exe` not found in:\n{exe_path}")
+            messagebox.showerror("Start", f"openmsx.exe not found in {exe_path}")
             return
 
         machine = (self.machine_var.get() or self.db.get("openmsx_machine") or "").strip()
         if not machine:
-            messagebox.showwarning("Machine not selected",
-                                   "Please select an MSX model from the combobox before starting.")
+            messagebox.showerror("Start", "No MSX machine selected.")
             return
 
+        # Build a basic command. Users can modify the frontend later to pass media/extension args.
         try:
-            cmd = [exe_path, "-machine", machine]
-
-            exts = self._get_selected_extensions()
-            for e in exts:
-                cmd.extend(["-ext", e])
-
-            proc = subprocess.Popen(cmd, cwd=dir_path)
-            initial_pid = proc.pid
-            real_pid = initial_pid
-
-            try:
-                import psutil
-                deadline = time.time() + 2.0
-                while time.time() < deadline:
-                    matches = []
-                    for p in psutil.process_iter(['pid', 'exe', 'ppid']):
-                        try:
-                            exe = p.info.get('exe')
-                            if exe and os.path.normcase(os.path.normpath(exe)) == os.path.normcase(os.path.normpath(exe_path)):
-                                matches.append(p.pid)
-                        except Exception:
-                            continue
-                    if matches:
-                        real_pid = matches[-1]
-                        break
-                    try:
-                        parent = psutil.Process(initial_pid)
-                        children = parent.children(recursive=True)
-                        if children:
-                            real_pid = children[-1].pid
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(0.15)
-            except ImportError:
-                messagebox.showwarning("psutil not installed",
-                                       "Install `psutil` to improve PID detection (pip install psutil). Using initial PID.")
-            except Exception:
-                pass
-
-            try:
-                self.db.set("openmsx_pid", str(real_pid))
-            except Exception:
-                pass
-            self.pid_var.set(f"PID: {real_pid}")
-
-            ext_part = " ".join([f"-ext {e}" for e in exts]) if exts else ""
-            self.status_var.set(f"openMSX started: {exe_path} -machine {machine} {ext_part}".strip())
-
-            self._update_socket_button(real_pid)
+            proc = subprocess.Popen([exe_path], cwd=dir_path)
+            pid = proc.pid
+            self.db.set("openmsx_pid", str(pid))
+            self.pid_var.set(f"PID: {pid}")
+            self._update_socket_button(pid)
+            self.status_var.set("openMSX started.")
         except Exception as e:
-            messagebox.showerror("Start Error", f"Failed to start openMSX:\n{e}")
+            messagebox.showerror("Start", f"Failed to start openMSX:\n{e}")
 
     def _update_socket_button(self, pid: int):
         temp_dir = os.getenv("TEMP") or os.getcwd()
@@ -573,35 +792,27 @@ class OpenMSXFrontend:
         self.socket_var.set(f"Socket:\n{socket_path}")
 
         if hasattr(self, "btn_socket"):
-            try:
-                exists = os.path.exists(socket_path)
-                self.btn_socket.configure(state="normal", fg_color="green" if exists else "red")
-            except Exception:
-                try:
-                    self.btn_socket.configure(state="normal", fg_color="gray")
-                except Exception:
-                    pass
+            if os.path.exists(socket_path):
+                self.btn_socket.configure(fg_color="#66cc66")  # green
+                self.btn_socket.configure(state="normal")
+            else:
+                self.btn_socket.configure(fg_color="gray")
+                self.btn_socket.configure(state="normal")
 
     def _check_socket(self):
         path = self.current_socket_path
         if not path:
-            messagebox.showwarning("Socket", "No socket path available.")
+            messagebox.showinfo("Socket", "No socket path available.")
             return
         if os.path.exists(path):
-            try:
-                subprocess.Popen(['explorer', f'/select,{path}'])
-            except Exception:
-                try:
-                    os.startfile(os.path.dirname(path))
-                except Exception as e:
-                    messagebox.showerror("Open Error", f"Can't open explorer:\n{e}")
+            messagebox.showinfo("Socket", f"Socket exists:\n{path}")
         else:
-            messagebox.showwarning("Socket not found", f"Socket doesn't exist at:\n{path}")
+            messagebox.showwarning("Socket", f"Socket not found:\n{path}")
 
     def open_config_window(self, initial: bool = False):
         win = ctk.CTkToplevel(self.root)
         win.title("Configuration")
-        win.geometry("640x160")
+        win.geometry("640x240")
         win.grab_set()
 
         cur_dir = self.db.get("openmsx_dir") or ""
@@ -624,35 +835,92 @@ class OpenMSXFrontend:
         btn_choose = ctk.CTkButton(entry_row, text="Browse", width=120, command=choose_dir)
         btn_choose.pack(side="right")
 
+        # Theme selection, File Hunter URL and MSX default directory
+        theme_row = ctk.CTkFrame(win, corner_radius=0)
+        theme_row.pack(fill="x", padx=12, pady=(4, 6))
+        theme_lbl = ctk.CTkLabel(theme_row, text="UI Theme:")
+        theme_lbl.pack(side="left", padx=(0, 8))
+        theme_var = ctk.StringVar(value=self.db.get("ui_theme") or "Light")
+        theme_cb = ctk.CTkComboBox(theme_row, values=["Light", "Dark", "Green"], variable=theme_var, width=220)
+        theme_cb.pack(side="left")
+
+        fh_row = ctk.CTkFrame(win, corner_radius=0)
+        fh_row.pack(fill="x", padx=12, pady=(4, 6))
+        fh_lbl = ctk.CTkLabel(fh_row, text="File Hunter URL:")
+        fh_lbl.pack(side="left", padx=(0, 8))
+        fh_var = ctk.StringVar(value=self.db.get("file_hunter_url") or "https://download.file-hunter.com/")
+        fh_entry = ctk.CTkEntry(fh_row, textvariable=fh_var)
+        fh_entry.pack(side="left", fill="x", expand=True)
+
+        msx_row = ctk.CTkFrame(win, corner_radius=0)
+        msx_row.pack(fill="x", padx=12, pady=(4, 6))
+        msx_lbl = ctk.CTkLabel(msx_row, text="Default MSX directory:")
+        msx_lbl.pack(side="left", padx=(0, 8))
+        msx_var = ctk.StringVar(value=self.db.get("msx_default_dir") or r"C:\msx")
+        msx_entry = ctk.CTkEntry(msx_row, textvariable=msx_var)
+        msx_entry.pack(side="left", fill="x", expand=True)
+
+        def choose_msx_dir():
+            d = filedialog.askdirectory(title="Select default MSX directory")
+            if d:
+                msx_var.set(d)
+
+        btn_msx_choose = ctk.CTkButton(msx_row, text="Browse", width=90, command=choose_msx_dir)
+        btn_msx_choose.pack(side="right", padx=(6, 0))
+
         btn_frame = ctk.CTkFrame(win, corner_radius=0)
         btn_frame.pack(fill="x", padx=12, pady=(8, 12))
 
         def reset():
             entry_var.set("")
+            theme_var.set("Light")
+            fh_var.set("https://download.file-hunter.com/")
+            msx_var.set(r"C:\msx")
 
         def save():
             path = entry_var.get().strip()
             if not path:
-                messagebox.showwarning("Validation", "Directory cannot be empty.")
+                messagebox.showerror("Configuration", "openMSX directory cannot be empty.")
                 return
             exe_path = os.path.join(path, "openmsx.exe")
             if not os.path.isfile(exe_path):
-                messagebox.showerror("Not found", f"`openmsx.exe` not found at:\n{exe_path}")
+                messagebox.showerror("Configuration", f"`openmsx.exe` not found in:\n{exe_path}")
                 return
             try:
                 self.db.set("openmsx_dir", path)
+                self.db.set("ui_theme", theme_var.get())
+                self.db.set("file_hunter_url", fh_var.get().strip())
+                self.db.set("msx_default_dir", msx_var.get().strip())
+                # apply theme immediately
+                chosen = theme_var.get()
+                if chosen == "Green":
+                    ctk.set_appearance_mode("Light")
+                    try:
+                        ctk.set_default_color_theme("green")
+                    except Exception:
+                        ctk.set_default_color_theme("blue")
+                elif chosen == "Dark":
+                    ctk.set_appearance_mode("Dark")
+                    ctk.set_default_color_theme("blue")
+                else:
+                    ctk.set_appearance_mode("Light")
+                    ctk.set_default_color_theme("blue")
+                self.file_hunter_url = fh_var.get().strip()
+                self.msx_default_dir = msx_var.get().strip()
+                win.destroy()
+                # reload machines/extensions with new openmsx_dir
                 self._load_machines()
                 self._load_extensions()
-                self._update_status()
             except Exception as e:
-                messagebox.showerror("Save Error", f"Failed saving configuration:\n{e}")
-            finally:
-                win.destroy()
+                messagebox.showerror("Configuration", f"Failed saving configuration:\n{e}")
 
         def cancel():
             win.destroy()
             if initial and not self.db.get("openmsx_dir"):
-                messagebox.showinfo("Configuration required", "Configuration not completed. You can configure later using the 'Configuration' button.")
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
 
         btn_reset = ctk.CTkButton(btn_frame, text="Reset", command=reset)
         btn_reset.pack(side="left", padx=6, pady=6)
@@ -669,51 +937,46 @@ class OpenMSXFrontend:
     def _update_status(self):
         openmsx_dir = self.db.get("openmsx_dir")
         if openmsx_dir:
-            self.status_var.set(f"openMSX: {openmsx_dir}")
+            self.status_var.set(f"openMSX dir: {openmsx_dir}")
         else:
-            self.status_var.set("openMSX not configured")
+            self.status_var.set("openMSX dir: not set")
 
         pid = self.db.get("openmsx_pid")
         if pid:
             try:
-                pid_int = int(pid)
-                self.pid_var.set(f"PID: {pid_int}")
-                self._update_socket_button(pid_int)
-            except (ValueError, TypeError):
+                p = int(pid)
+                self.pid_var.set(f"PID: {p}")
+                self._update_socket_button(p)
+            except Exception:
                 self.pid_var.set("PID: invalid")
-                self.socket_var.set("Socket:\n-")
-                self.current_socket_path = None
-                if hasattr(self, "btn_socket"):
-                    try:
-                        self.btn_socket.configure(state="disabled", fg_color="gray")
-                    except Exception:
-                        pass
         else:
             self.pid_var.set("PID: Not started")
-            self.socket_var.set("Socket:\n-")
-            self.current_socket_path = None
-            if hasattr(self, "btn_socket"):
-                try:
-                    self.btn_socket.configure(state="disabled", fg_color="gray")
-                except Exception:
-                    pass
 
         saved = self.db.get("openmsx_machine")
         if saved and saved in self._machines_cache:
             self.machine_var.set(saved)
 
+        last_disk = self.db.get("disk_a_current")
+        if last_disk:
+            self.disk_a_var.set(last_disk)
+
+        last_disk_b = self.db.get("disk_b_current")
+        if last_disk_b:
+            self.disk_b_var.set(last_disk_b)
+
+        last_cart = self.db.get("cart_a_current")
+        if last_cart:
+            self.cart_a_var.set(last_cart)
+
+        last_cart_b = self.db.get("cart_b_current")
+        if last_cart_b:
+            self.cart_b_var.set(last_cart_b)
+
     def open_client_window(self):
         try:
-            if getattr(self, "_client_window", None):
-                try:
-                    if self._client_window.win.winfo_exists():
-                        self._client_window.win.lift()
-                        return
-                except Exception:
-                    pass
-            self._client_window = OpenMSXClientWindow(self.root)
+            OpenMSXClientWindow(self.root)
         except Exception as e:
-            messagebox.showerror("Client Error", f"Cannot open client window:\n{e}")
+            messagebox.showerror("Client", str(e))
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -721,12 +984,30 @@ class OpenMSXFrontend:
 
     def _on_close(self):
         try:
-            self.db.close()
+            # persist histories and current selections
+            try:
+                self.db.set("disk_a_history", json.dumps(self.disk_a_history))
+                self.db.set("disk_b_history", json.dumps(self.disk_b_history))
+                self.db.set("cart_a_history", json.dumps(self.cart_a_history))
+                self.db.set("cart_b_history", json.dumps(self.cart_b_history))
+                # current selections
+                self.db.set("disk_a_current", self.disk_a_var.get() or "")
+                self.db.set("disk_b_current", self.disk_b_var.get() or "")
+                self.db.set("cart_a_current", self.cart_a_var.get() or "")
+                self.db.set("cart_b_current", self.cart_b_var.get() or "")
+            except Exception:
+                pass
         finally:
-            self.root.destroy()
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
 
     def _check_local_port(self, port: int) -> bool:
-        """Return True if a TCP connection to localhost:port can be established quickly."""
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return True
@@ -734,34 +1015,63 @@ class OpenMSXFrontend:
             return False
 
     def _start_port_watcher(self, interval: float = 2.0):
-        """
-        Background loop: read the port file and test connection.
-        Updates `Client TCP` button color on the GUI thread:
-          - green if connection succeeds
-          - gray if no open port found or connection fails
-        """
         while True:
             try:
                 port = find_port_from_temp()
-                is_open = False
-                if port:
-                    is_open = self._check_local_port(port)
-
-                def _update_button(opened=is_open):
+                if port and self._check_local_port(port):
+                    # update button color on main thread
+                    def _set_green():
+                        try:
+                            self.btn_client.configure(fg_color="#66cc66")
+                        except Exception:
+                            pass
+                    self.root.after(0, _set_green)
+                else:
+                    def _set_gray():
+                        try:
+                            self.btn_client.configure(fg_color="gray")
+                        except Exception:
+                            pass
+                    self.root.after(0, _set_gray)
+                # update socket path if pid stored
+                pid = self.db.get("openmsx_pid")
+                if pid:
                     try:
-                        if hasattr(self, "btn_client"):
-                            color = "green" if opened else "gray"
-                            self.btn_client.configure(fg_color=color)
+                        p = int(pid)
+                        self._update_socket_button(p)
                     except Exception:
                         pass
-
-                try:
-                    self.root.after(0, _update_button)
-                except Exception:
-                    pass
             except Exception:
                 pass
             time.sleep(interval)
+
+
+def find_port_from_temp() -> Optional[int]:
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if not local_appdata:
+        return None
+    base = os.path.join(local_appdata, "Temp", "openmsx-default")
+    if not os.path.isdir(base):
+        return None
+    files = [f for f in glob.glob(os.path.join(base, "*")) if os.path.isfile(f)]
+    if not files:
+        return None
+    latest = max(files, key=os.path.getmtime)
+    try:
+        with open(latest, "r", encoding="utf-8", errors="ignore") as fh:
+            content = fh.read().strip()
+            # try parse as int or extract number
+            try:
+                return int(content)
+            except Exception:
+                # try find first number in text
+                import re
+                m = re.search(r"\d+", content)
+                if m:
+                    return int(m.group(0))
+    except Exception:
+        return None
+    return None
 
 
 if __name__ == "__main__":
